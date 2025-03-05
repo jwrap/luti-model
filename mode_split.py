@@ -439,14 +439,15 @@ def expand_dataframe(input_df):
 def mode_split_aggregated(travel_times, T_ij,
                 CO_time_coefficient = -0.0004, NCO_time_coefficient = -0.0003,
                 CO_constant_CAR = 0.23, CO_constant_BIKE = - 3.1, NCO_constant_BIKE = -2.51):
-
-    #############################################
-    # USE THIS WHEN LACKING A MODE CHOICE MODEL #
-    #############################################
-
-    # INPUTS
-    # travel_times = dict with keys as mode names and values as mode travel time matrix
-    # T_ij = dict with keys as vehicle ownership status and values as OD matrix
+    
+    #######################################################################################
+    # INPUTS                                                                              #
+    # travel_times = dict with keys as mode names and values as mode travel time matrix.  #
+    # T_ij = dict with keys as vehicle ownership status and values as OD matrix           #
+    #                                                                                     #
+    # Coefficients and constants are derived from a mode choice model.                    #
+    # CO = Car-Owners; NCO = Non-Car-Owners                                               #
+    # #####################################################################################
 
     V_ij_CAR_CO = travel_times['DRIVE'] * CO_time_coefficient + CO_constant_CAR # Car
     V_ij_BIKE_CO = travel_times['BIKE'] * CO_time_coefficient + CO_constant_BIKE # Bike
