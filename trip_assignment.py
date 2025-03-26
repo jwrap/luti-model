@@ -1,7 +1,7 @@
 import pandas as pd
 import geopandas as gpd
 import networkx as nx
-import itertools, warnings, os, pickle, sys
+import itertools, warnings, os, pickle, sys, gc
 import pandana as pdna
 warnings.filterwarnings("ignore")
 from collections import defaultdict
@@ -20,8 +20,6 @@ def generate_aon_paths(g_df, node_df, subzone_nodes_df, network_twoway=False):
     destinations = [d for o, d in perms]
 
     node_df = node_df.set_index('nodeID')
-    if g_df['time'].min() < 0.01:
-        g_df['time'] = g_df['time'] * 1000
 
     # Initialize network
     net = pdna.Network(node_df["x"], node_df["y"], g_df["source"], g_df["target"],
@@ -32,42 +30,47 @@ def generate_aon_paths(g_df, node_df, subzone_nodes_df, network_twoway=False):
 
     return paths_dict
 
-def generate_aon_impedance_matrix(g_df, node_df, subzone_nodes_df, network_twoway=False):
-    subzone_nodes_df.columns = ['ZONE_CODE', 'nodeID']
-    od_nodes = subzone_nodes_df['nodeID'].tolist()
+def generate_aon_impedance_matrix(g_df, node_df, subzone_nodes_df, imp_name='time', network_twoway=False):
+    if subzone_nodes_df is pd.DataFrame():
+        subzone_nodes_df.columns = ['ZONE_CODE', 'nodeID']
+        od_nodes = subzone_nodes_df['nodeID'].tolist()
+        zone_node_map = dict(zip(subzone_nodes_df['nodeID'], subzone_nodes_df['ZONE_CODE']))
+    else:
+        od_codes = subzone_nodes_df.copy()
+        od_nodes = [f'MTZ{int(x)}' for x in od_codes]
+        zone_node_map = dict(zip(od_nodes, od_codes))
+
+    if imp_name == 'length':
+        imp_title = ""
+    else:
+        imp_title = "Time"
+
     perms = [perm for perm in itertools.permutations(od_nodes, 2)]
     origins = [o for o, d in perms]
     destinations = [d for o, d in perms]
+    node_df = node_df.drop_duplicates('nodeID')
     node_df = node_df.set_index('nodeID')
-    g_df['time'] = g_df['time'].clip(lower=1e-4, upper=500)
+    g_df[imp_name] = g_df[imp_name].clip(lower=1e-4, upper=500)
+    g_df = g_df[g_df['source'].isin(node_df.index) & g_df['target'].isin(
+        node_df.index)]
 
     # Pandana shortest_path calculations go haywire when imp. values are too small.
     # Use "amplifier" as an ad-hoc solution to avoid computation errors
     # Initialize network
     net = pdna.Network(node_df["x"], node_df["y"], g_df["source"], g_df["target"],
-                       g_df[["time"]], twoway=network_twoway)
+                       g_df[[imp_name]], twoway=network_twoway)
 
     # Get shortest (TIME) path lengths between all ODs for cars
-    paths_lengths = net.shortest_path_lengths(origins, destinations, imp_name='time')
-
-    # tuple_edge_name = dict(zip(zip(g_df['source'].astype(int), g_df['target'].astype(int)), g_df['edge']))
-    # edges = [[tuple_edge_name[(int(path[i]), int(path[i + 1]))] for i in range(len(path) - 1)] for path in paths]
-    # all_edges = {edge for set_of_edges in edges for edge in set_of_edges}
-    # filtered_g_df = g_df[g_df['edge'].isin(all_edges)]
-    # edge_to_time = dict(zip(filtered_g_df['edge'], filtered_g_df['time']))
-    # path_lengths = [sum(edge_to_time[edge] for edge in set_of_edges) for set_of_edges in edges]
-
-
-    paths_dict = dict(zip(tuple(zip(origins, destinations)), path_lengths))
-    zone_node_map = dict(zip(subzone_nodes_df['nodeID'], subzone_nodes_df['ZONE_CODE']))
+    paths_lengths = net.shortest_path_lengths(origins, destinations, imp_name=imp_name)
 
     # Interzonal PT times only
     pt_od_long = pd.DataFrame()
     pt_od_long['Origin'] = [zone_node_map[x] for x in origins]
     pt_od_long['Destination'] = [zone_node_map[x] for x in destinations]
-    pt_od_long['Time'] = paths_lengths
-    pt_od_paths = pt_od_long[['Origin', 'Destination', 'Time']]
-    pt_od_wide = pt_od_paths.pivot(columns='Destination', index='Origin', values='Time')
+    pt_od_long[imp_title] = paths_lengths
+
+    pt_od_paths = pt_od_long[['Origin', 'Destination', imp_title]]
+    pt_od_wide = pt_od_paths.pivot(columns='Destination', index='Origin', values=imp_title)
     impedance_matrix = pt_od_wide[sorted(pt_od_wide.columns)].sort_index().fillna(0)
 
     impedance_matrix = impedance_matrix.astype(float)
@@ -129,9 +132,10 @@ def prepare_capped_network(network_edges_gdf, network_node_gdf, base_capacity, n
 
 def process_chunk_combined_with_lpaths(chunk, tuple_edge_name, OD_json):
 
-    ####################################################
-    # Some parallelization to speed up trip assignment #
-    ####################################################
+    ##########################################################
+    # Some parallelization to speed up trip assignment       #
+    # Currently unused as explode_edges_in_batches is faster #
+    ##########################################################
 
     local_lpaths = {}  # Store lpaths for the batch
     local_potential_volume = defaultdict(float)  # Store potential_volume for the batch
@@ -154,9 +158,10 @@ def process_chunk_combined_with_lpaths(chunk, tuple_edge_name, OD_json):
 
 def compute_potential_volume_and_lpaths(perms_paths, tuple_edge_name, OD_json, batch_size=30000, n_workers=10):
 
-    ####################################################
-    # Some parallelization to speed up trip assignment #
-    ####################################################
+    ##########################################################
+    # Some parallelization to speed up trip assignment       #
+    # Currently unused as explode_edges_in_batches is faster #
+    ##########################################################
 
     # Split perms_paths into batches
     batches = [perms_paths[i:i + batch_size] for i in range(0, len(perms_paths), batch_size)]
@@ -184,20 +189,21 @@ def compute_potential_volume_and_lpaths(perms_paths, tuple_edge_name, OD_json, b
 def trip_assignment_uncapped(g_df, node_df, subzone_node_map, impedance_matrix, zone_codes, OD_json):
 
     #######################################################################################################################################################
-    # INPUTS:
-    # g_df: graph dataframe of network as produced by prepare_uncapped_network function
-    # node_df: node dataframe of network as produced by prepare_uncapped_network function
-    # subzone_node_map: mapping from string nodeID to integer nodeID as produced by prepare_uncapped_network function.
-    # impedance_matrix: pre-calculated shortest path travel times (uncapped assumption means we can use precalculated (free-flow) travel times
-    # zone_codes: list of zone codes, in 'correct' order
-    # OD_json: trip OD matrices as produced in the preceding mode_split step
-    #
-    # OUTPUTS:
-    # vol_df: Volume (variable: demand) of traffic on each link in the network
-    # travel_times: Shortest path travel time for each OD pair
-    # distance_df: Shortest path distance for each OD pair
+    # INPUTS:                                                                                                                                             #
+    # g_df: graph dataframe of network as produced by prepare_uncapped_network function                                                                   #
+    # node_df: node dataframe of network as produced by prepare_uncapped_network function                                                                 #
+    # subzone_node_map: mapping from string nodeID to integer nodeID as produced by prepare_uncapped_network function.                                    #
+    # impedance_matrix: pre-calculated shortest path travel times (uncapped assumption means we can use precalculated (free-flow) travel times            #
+    # zone_codes: list of zone codes, in 'correct' order                                                                                                  #
+    # OD_json: trip OD matrices as produced in the preceding mode_split step                                                                              #
+    #                                                                                                                                                     #
+    # OUTPUTS:                                                                                                                                            #
+    # vol_df: Volume (variable: demand) of traffic on each link in the network                                                                            #
+    # travel_times: Shortest path travel time for each OD pair                                                                                            #
+    # distance_df: Shortest path distance for each OD pair                                                                                                #
     #######################################################################################################################################################
 
+    # The keys in this dictionary are meant to match the edge names used in the g_df source/target columns
     subzone_node_map = {float(k[3:]) if "MTZ" in k else float(k[-2:]): v for k, v in subzone_node_map.items() if "MTZ" in k or "CENTROID" in k}
 
     nt = Network('net')
@@ -219,46 +225,34 @@ def trip_assignment_uncapped(g_df, node_df, subzone_node_map, impedance_matrix, 
     distance_df['Destination'] = [d for o, d in perms]
     distance_df['Distance_M'] = distances
 
-    perm_paths = list(zip(perms, paths))
     tuple_edge_name = dict(zip(zip(g_df['source'].astype(int), g_df['target'].astype(int)), g_df['edge']))
+    edge_map_df = pd.DataFrame(list(tuple_edge_name.items()), columns=["EDGES_TUPLES", "EDGE_NAME"])
     potential_volume = {link: 0 for link in nt.edgenode.values()}
-    potential_volume_, lpaths = compute_potential_volume_and_lpaths(
-        perm_paths, tuple_edge_name, OD_json, batch_size=10000, n_workers=10)
 
-    # link_index = {link: idx for idx, link in enumerate(potential_volume.keys())}
-    # paths_links = []
-    #
-    # for path in paths:
-    #     sources = path[:-1]
-    #     targets = path[1:]
-    #     links = [tuple_edge_name.get((src, tgt), None) for src, tgt in zip(sources, targets)]
-    #     paths_links.append(links)
-    #
-    # # Flatten paths_links into lists for bulk processing
-    # flat_row_indices = []
-    # flat_col_indices = []
-    # flat_data = []
-    #
-    # for idx, path_links in enumerate(paths_links):
-    #     valid_links = [link_index[link] for link in path_links if link in link_index]
-    #     flat_row_indices.extend([idx] * len(valid_links))
-    #     flat_col_indices.extend(valid_links)
-    #     flat_data.extend([1] * len(valid_links))
-    #
-    # # Convert to numpy arrays
-    # row_indices_np = np.array(flat_row_indices, dtype=np.int32)
-    # col_indices_np = np.array(flat_col_indices, dtype=np.int32)
-    # data_np = np.array(flat_data, dtype=np.int8)
-    #
-    # # Build COO matrix
-    # incidence_matrix_coo = coo_matrix((data_np, (row_indices_np, col_indices_np)),
-    #                                   shape=(len(paths_links), len(link_index)))
-    #
-    # # Convert to CSR
-    # incidence_matrix = incidence_matrix_coo.tocsr()
-    # demand_vector = np.array([OD_json.loc[perm[0], perm[1]] for perm in perms], dtype=np.float32)
-    # potential_volume_array = incidence_matrix.T.dot(demand_vector)
-    # potential_volume_ = {link: potential_volume_array[idx] for link, idx in link_index.items()}
+    # perm_paths = list(zip(perms, paths))
+    # potential_volume_, lpaths = compute_potential_volume_and_lpaths(
+    #     perm_paths, tuple_edge_name, OD_json, batch_size=30000, n_workers=10)
+
+    shortest_paths_df = pd.DataFrame({
+        'ORIGIN_MTZ_1': [o for o, d in perms],
+        'DEST_MTZ_1': [d for o, d in perms],
+        'ROUTES': paths})
+    shortest_paths_df = shortest_paths_df.merge(
+        OD_json.melt(ignore_index=False).reset_index().rename(columns={"value": "DEMAND"}),
+        on=['ORIGIN_MTZ_1', 'DEST_MTZ_1'], how='left')
+
+    batch_size = 5000
+    num_batches = (len(shortest_paths_df) // batch_size) + 1
+    batches = [shortest_paths_df.iloc[i * batch_size: (i + 1) * batch_size] for i in range(num_batches)]
+
+    with Parallel(n_jobs=4, backend='loky') as parallel:
+        results = parallel(delayed(explode_edges_in_batches)(batch) for batch in batches)
+
+    # Combine all batch results into a single DataFrame
+    master_df = pd.concat(results, ignore_index=True)
+    master_df = master_df.groupby("EDGES_TUPLES", as_index=False)["DEMAND"].sum()
+    master_df = master_df.merge(edge_map_df, on='EDGES_TUPLES', how='left').drop(columns=["EDGES_TUPLES"])
+    potential_volume_ = master_df.set_index("EDGE_NAME").to_dict()['DEMAND']
 
     potential_volume.update(potential_volume_)
 
@@ -273,8 +267,24 @@ def trip_assignment_uncapped(g_df, node_df, subzone_node_map, impedance_matrix, 
 
     return vol_df, travel_times, distance_df
 
+def explode_edges_in_batches(batch_df):
+    ################################################################################
+    # Converts routes to edges, aggregates demand, and returns the batch results.  #
+    ################################################################################
+
+    # Convert node sequences into edge tuples
+    batch_df["EDGES_TUPLES"] = batch_df["ROUTES"].apply(lambda x: list(zip(x[:-1], x[1:])))
+
+    # Explode to get one edge per row
+    exploded_batch = batch_df.explode("EDGES_TUPLES")
+
+    # Aggregate demand per edge tuple
+    batch_travel_volume = exploded_batch.groupby("EDGES_TUPLES", as_index=False)["DEMAND"].sum()
+
+    return batch_travel_volume
+
 def trip_assignment_capped(g_df, node_df, subzone_node_map, zone_codes, OD_json, convergence_criteria=1, twoway=False):
-    # 2024-10-08 Sped up with pandana and data processing parallelized
+    # 2025-03-15 Sped up with vectorised operations
     # Used for networks for which capacity is a concern
 
     #######################################################################################################################
@@ -312,18 +322,42 @@ def trip_assignment_capped(g_df, node_df, subzone_node_map, zone_codes, OD_json,
     dest_codes = [subzone_node_map[d] for o, d in perms]
 
     g_df['time'] = g_df['time'].clip(lower=1e-4, upper=500)
-    pdna_net = pdna.Network(node_df["x"], node_df["y"], g_df["source"], g_df["target"], g_df[['time', 'length']], twoway=twoway)
+    pdna_net = pdna.Network(node_df["x"], node_df["y"], g_df["source"], g_df["target"], g_df[['time']], twoway=twoway)
     print('initialized pandana network')
 
     paths = pdna_net.shortest_paths(origin_codes, dest_codes, imp_name='time')
     tuple_edge_name = dict(zip(zip(g_df['source'].astype(int), g_df['target'].astype(int)), g_df['edge']))
-    perm_paths = list(zip(perms, paths))
+    edge_map_df = pd.DataFrame(list(tuple_edge_name.items()), columns=["EDGES_TUPLES", "EDGE_NAME"])
 
     print('calculated shortest path lengths, now updating potential_volume')
     potential_volume = empty.copy()
 
-    potential_volume_, lpaths = compute_potential_volume_and_lpaths(
-        perm_paths, tuple_edge_name, OD_json, batch_size=10000, n_workers=10)
+    shortest_paths_df = pd.DataFrame({
+        'ORIGIN_MTZ_1': [o for o, d in perms],
+        'DEST_MTZ_1': [d for o, d in perms],
+        'ROUTES': paths})
+    shortest_paths_df = shortest_paths_df.merge(
+        OD_json.melt(ignore_index=False).reset_index().rename(columns={"value": "DEMAND"}),
+        on=['ORIGIN_MTZ_1', 'DEST_MTZ_1'], how='left')
+
+    batch_size = 5000
+    num_batches = (len(shortest_paths_df) // batch_size) + 1
+    batches = [shortest_paths_df.iloc[i * batch_size: (i + 1) * batch_size] for i in range(num_batches)]
+
+    with Parallel(n_jobs=4, backend='loky') as parallel:
+        results = parallel(delayed(explode_edges_in_batches)(batch) for batch in batches)
+
+    # Combine all batch results into a single DataFrame
+    master_df = pd.concat(results, ignore_index=True)
+    master_df = master_df.groupby("EDGES_TUPLES", as_index=False)["DEMAND"].sum()
+    master_df = master_df.merge(edge_map_df, on='EDGES_TUPLES', how='left').drop(columns=["EDGES_TUPLES"])
+    potential_volume_ = master_df.set_index("EDGE_NAME").to_dict()['DEMAND']
+
+    shortest_paths_df = shortest_paths_df.drop(columns=['DEMAND'])
+
+    # perm_paths = list(zip(perms, paths))
+    # potential_volume_, lpaths = compute_potential_volume_and_lpaths(
+    #     perm_paths, tuple_edge_name, OD_json, batch_size=30000, n_workers=10)
 
     potential_volume.update(potential_volume_)
     volume = potential_volume.copy()
@@ -345,50 +379,30 @@ def trip_assignment_capped(g_df, node_df, subzone_node_map, zone_codes, OD_json,
         new_weights_df['time'] = new_weights_df['time'].clip(lower=1e-4, upper=500)
 
         pdna_net = pdna.Network(node_df["x"], node_df["y"], g_df["source"], g_df["target"],
-                                    new_weights_df[['time', 'length']], twoway=twoway)
+                                    new_weights_df[['time']], twoway=twoway)
 
         paths = pdna_net.shortest_paths(origin_codes, dest_codes, imp_name='time')
-        tuple_edge_name = dict(zip(zip(g_df['source'].astype(int), g_df['target'].astype(int)), g_df['edge']))
+        # perm_paths = list(zip(perms, paths))
+        # potential_volume_, lpaths = compute_potential_volume_and_lpaths(
+        #     perm_paths, tuple_edge_name, OD_json, batch_size=30000, n_workers=10)
 
-        # link_index = {link: idx for idx, link in enumerate(potential_volume.keys())}
-        # paths_links = []
-        #
-        # for path in paths:
-        #     sources = path[:-1]
-        #     targets = path[1:]
-        #     links = [tuple_edge_name.get((src, tgt), None) for src, tgt in zip(sources, targets)]
-        #     paths_links.append(links)
-        #
-        # # Flatten paths_links into lists for bulk processing
-        # flat_row_indices = []
-        # flat_col_indices = []
-        # flat_data = []
-        #
-        # for idx, path_links in enumerate(paths_links):
-        #     valid_links = [link_index[link] for link in path_links if link in link_index]
-        #     flat_row_indices.extend([idx] * len(valid_links))
-        #     flat_col_indices.extend(valid_links)
-        #     flat_data.extend([1] * len(valid_links))
-        #
-        # # Convert to numpy arrays
-        # row_indices_np = np.array(flat_row_indices, dtype=np.int32)
-        # col_indices_np = np.array(flat_col_indices, dtype=np.int32)
-        # data_np = np.array(flat_data, dtype=np.int8)
-        #
-        # # Build COO matrix
-        # incidence_matrix_coo = coo_matrix((data_np, (row_indices_np, col_indices_np)),
-        #                                   shape=(len(paths_links), len(link_index)))
-        #
-        # # Convert to CSR
-        # incidence_matrix = incidence_matrix_coo.tocsr()
-        # demand_vector = np.array([OD_json.loc[perm[0], perm[1]] for perm in perms], dtype=np.float32)
-        # potential_volume_array = incidence_matrix.T.dot(demand_vector)
-        # potential_volume_ = {link: potential_volume_array[idx] for link, idx in link_index.items()}
+        shortest_paths_df['paths'] = paths
+        shortest_paths_df = shortest_paths_df.merge(
+            OD_json.melt(ignore_index=False).reset_index().rename(columns={"value": "DEMAND"}),
+            on=['ORIGIN_MTZ_1', 'DEST_MTZ_1'], how='left')
 
-        perm_paths = list(zip(perms, paths))
-        # print("Parallel: Compiling lpaths and potential_volumes")
-        potential_volume_, lpaths = compute_potential_volume_and_lpaths(
-            perm_paths, tuple_edge_name, OD_json, batch_size=10000, n_workers=10)
+        batch_size = 5000
+        num_batches = (len(shortest_paths_df) // batch_size) + 1
+        batches = [shortest_paths_df.iloc[i * batch_size: (i + 1) * batch_size] for i in range(num_batches)]
+
+        with Parallel(n_jobs=4, backend='loky') as parallel:
+            results = parallel(delayed(explode_edges_in_batches)(batch) for batch in batches)
+
+        # Combine all batch results into a single DataFrame
+        master_df = pd.concat(results, ignore_index=True)
+        master_df = master_df.groupby("EDGES_TUPLES", as_index=False)["DEMAND"].sum()
+        master_df = master_df.merge(edge_map_df, on='EDGES_TUPLES', how='left').drop(columns=["EDGES_TUPLES"])
+        potential_volume_ = master_df.set_index("EDGE_NAME").to_dict()['DEMAND']
 
         potential_volume.update(potential_volume_)
 
@@ -400,6 +414,9 @@ def trip_assignment_capped(g_df, node_df, subzone_node_map, zone_codes, OD_json,
         potential_volume = empty.copy()
 
         print(f'end of iteration: {x} \t\t cal_limit: {cal_limit(volume, temp_vol)} \t\t step: {step}')
+
+    pdna_net = pdna.Network(node_df["x"], node_df["y"], g_df["source"], g_df["target"],
+                                    new_weights_df[['time', 'length']], twoway=twoway)
 
     costs = pdna_net.shortest_path_lengths(origin_codes, dest_codes, imp_name='time')
     travel_times = pd.DataFrame()
@@ -419,5 +436,6 @@ def trip_assignment_capped(g_df, node_df, subzone_node_map, zone_codes, OD_json,
     vol_df.rename(columns={"index": "edge"}, inplace=True)
     vol_df = gpd.GeoDataFrame(vol_df.merge(g_df[['edge', 'geometry', 'capacity']], on='edge', how='left'))
     vol_df['demand/capacity'] = vol_df['demand'] / vol_df['capacity']
+    gc.collect()
 
     return vol_df, travel_times, distance_df

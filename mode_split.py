@@ -169,9 +169,6 @@ def compile_mode_choice_attributes(roads_time_input, bike_time_input,
     compilation['CAR_CAB_FARE'] = np.round(compilation['CAR_CAB_FARE']).clip(lower=8)
     compilation['CAR_FUEL_COST'] = compilation['CAR_DIST_KM'] * 0.25
 
-    compilation['PT_FARE_COST'] = np.round(((compilation['PT_IVT'] - compilation['PT_IVT'].min()) / (
-            compilation['PT_IVT'].max() - compilation['PT_IVT'].min())) * (3.5 - 1.09) + 1.09)
-
     # PT minimum fare = $1.09-$2.97 (bus); $1.09 - $2.50 (train)
     compilation['PT_FARE_COST'] = np.where(compilation['PT_NUM_MODES'] == {"SUBWAY", "BUS"},
                                                 ((compilation['PT_IVT'] - compilation['PT_IVT'].min()) / (
