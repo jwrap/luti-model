@@ -386,7 +386,10 @@ def trip_assignment_capped(g_df, node_df, subzone_node_map, zone_codes, OD_json,
         # potential_volume_, lpaths = compute_potential_volume_and_lpaths(
         #     perm_paths, tuple_edge_name, OD_json, batch_size=30000, n_workers=10)
 
-        shortest_paths_df['paths'] = paths
+        shortest_paths_df = pd.DataFrame({
+            'ORIGIN_MTZ_1': [o for o, d in perms],
+            'DEST_MTZ_1': [d for o, d in perms],
+            'ROUTES': paths})
         shortest_paths_df = shortest_paths_df.merge(
             OD_json.melt(ignore_index=False).reset_index().rename(columns={"value": "DEMAND"}),
             on=['ORIGIN_MTZ_1', 'DEST_MTZ_1'], how='left')
